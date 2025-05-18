@@ -1,0 +1,164 @@
+#include <ESP8266WiFi.h>
+#include <SoftwareSerial.h>
+#include "Adafruit_MQTT.h"
+#include "Adafruit_MQTT_Client.h"
+#include <SPI.h>
+#include <MFRC522.h>
+
+// SIM808 Serial Pins
+#define RXPin 5  // D1 (GPIO5)
+#define TXPin 4  // D2 (GPIO4)
+
+// RFID Pins
+#define RST_PIN D0  // GPIO16
+#define SS_PIN D8   // GPIO15
+
+// LED Pins
+#define GSM_LED 16 // D0 (GPIO16)
+#define GPS_LED 2  // D4 (GPIO2)
+
+SoftwareSerial sim808(RXPin, TXPin);
+MFRC522 mfrc522(SS_PIN, RST_PIN);  // Create MFRC522 instance
+
+// WiFi parameters
+#define WLAN_SSID "Promaxx"
+#define WLAN_PASS "Sandun123"
+
+// Adafruit IO credentials
+#define AIO_SERVER "io.adafruit.com"
+#define AIO_SERVERPORT 1883
+#define AIO_USERNAME "sasmsd2001"
+#define AIO_KEY "aio_KzhM64ij5nOXLy2WVziah7gfVXc0"
+
+WiFiClient client;
+Adafruit_MQTT_Client mqtt(&client, AIO_SERVER, AIO_SERVERPORT, AIO_USERNAME, AIO_KEY);
+Adafruit_MQTT_Publish GPSLocation = Adafruit_MQTT_Publish(&mqtt, AIO_USERNAME "/feeds/COSMOS");
+
+String latitude, longitude;
+
+void setup() {
+  Serial.begin(115200);
+  sim808.begin(9600);
+
+  pinMode(GSM_LED, OUTPUT);
+  pinMode(GPS_LED, OUTPUT);
+  digitalWrite(GSM_LED, LOW);
+  digitalWrite(GPS_LED, LOW);
+  
+  Serial.print("Connecting to Wi-Fi");
+  WiFi.begin(WLAN_SSID, WLAN_PASS);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to Wi-Fi!");
+  Serial.println(WiFi.localIP());
+
+  connectToMQTT();
+  initializeGPS();
+
+  SPI.begin();  // Initialize the SPI bus
+  mfrc522.PCD_Init();  // Initialize the MFRC522 RFID reader
+  Serial.println("RFID reader initialized.");
+}
+
+void connectToMQTT() {
+  Serial.print("Connecting to Adafruit IO...");
+  while (mqtt.connect() != 0) {
+    Serial.println(" Connection failed, retrying...");
+    delay(10000);
+  }
+  Serial.println(" Connected to Adafruit IO!");
+  digitalWrite(GSM_LED, HIGH); // Turn on GSM LED when connected
+}
+
+void initializeGPS() {
+  sendATCommand("AT", 1000);
+  sendATCommand("AT+CGNSPWR=1", 2000); // Enable GPS
+}
+
+void loop() {
+  if (!mqtt.ping(3)) {
+    if (!mqtt.connected()) {
+      connectToMQTT();
+    }
+  }
+
+  getGPSData();
+  if (!latitude.isEmpty() && !longitude.isEmpty()) {
+    digitalWrite(GPS_LED, HIGH); // Turn on GPS LED when valid data is received
+    sendToAdafruitIO();
+  } else {
+    Serial.println("Waiting for valid GPS data...");
+    digitalWrite(GPS_LED, LOW); // Turn off GPS LED if no valid data
+  }
+
+  // RFID card detection
+  if (mfrc522.PICC_IsNewCardPresent()) {
+    if (mfrc522.PICC_ReadCardSerial()) {
+      String rfidUID = "";
+      for (byte i = 0; i < mfrc522.uid.size; i++) {
+        rfidUID += String(mfrc522.uid.uidByte[i], HEX);
+      }
+      Serial.println("RFID UID: " + rfidUID);
+      
+      // Send SMS with RFID UID and GPS location
+      sendSMS(rfidUID);
+    }
+  }
+
+  delay(5000);
+}
+
+void sendATCommand(String command, int timeout) {
+  sim808.println(command);
+  delay(timeout);
+}
+
+void getGPSData() {
+  sendATCommand("AT+CGNSINF", 2000);
+  String response = "";
+  
+  long startTime = millis();
+  while (millis() - startTime < 2000) { // 2s timeout
+    while (sim808.available()) {
+      char c = sim808.read();
+      response += c;
+    }
+  }
+
+  Serial.println("GPS Response: " + response);
+
+  int thirdComma = response.indexOf(',', response.indexOf(',', response.indexOf(',') + 1) + 1);
+  int fourthComma = response.indexOf(',', thirdComma + 1);
+  int fifthComma = response.indexOf(',', fourthComma + 1);
+  
+  latitude = response.substring(thirdComma + 1, fourthComma);
+  longitude = response.substring(fourthComma + 1, fifthComma);
+
+  latitude.trim();
+  longitude.trim();
+}
+
+void sendToAdafruitIO() {
+  char gpsData[120];
+  snprintf(gpsData, sizeof(gpsData), "{\"lat\":\"%s\",\"lon\":\"%s\"}", latitude.c_str(), longitude.c_str());
+  
+  if (!GPSLocation.publish(gpsData)) {
+    Serial.println("Failed to send GPS data to Adafruit IO");
+  } else {
+    Serial.println("GPS Data sent: " + String(gpsData));
+  }
+}
+
+void sendSMS(String rfidUID) {
+  String message = "Your child entered the school van. Click below link to track the van: https://io.adafruit.com/sasmsd2001/dashboards/cosmos2\n";
+  message += "RFID UID: " + rfidUID + "\n";
+  message += "GPS Location: Latitude: " + latitude + ", Longitude: " + longitude;
+
+  // Send SMS using SIM808
+  sendATCommand("AT+CMGF=1", 2000); // Set SMS mode to text
+  sendATCommand("AT+CMGS=\"+94769382663\"", 2000); // Send SMS to the number
+  sendATCommand(message, 2000); // Send the message
+  sendATCommand(String((char)26), 2000); // Send CTRL+Z to send the SMS
+}
